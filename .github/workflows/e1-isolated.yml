@@ -76,20 +76,29 @@ jobs:
           SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
         run: |
           set -euo pipefail
-          "$E1_TOOLS_DIR/node-v24.21.0-linux-x64/bin/node" --test \
+          e1_stage=static-assertions
+          trap 'printf "FAIL: static/staging stage=%s line=%s\n" "$e1_stage" "$LINENO"' ERR
+          "$E1_TOOLS_DIR/node-v24.21.0-linux-x64/bin/node" --test --test-reporter=tap \
             "$CANDIDATE_DIR/tests/e1-negative.test.mjs" > "$RUNNER_TEMP/e1-static.log" 2>&1 || {
             echo 'FAIL: static candidate checks'; exit 1;
           }
+          echo 'PASS: static assertions'
+          e1_stage=fixture-path-preflight
           test ! -e "$E1_FIXTURE_DIR"
+          e1_stage=container-preflight
           test -z "$(docker ps -aq --filter label=com.supabase.cli.project=h1-g1-e1-ci-disposable)"
+          e1_stage=volume-preflight
           test -z "$(docker volume ls -q --filter label=com.supabase.cli.project=h1-g1-e1-ci-disposable)"
+          e1_stage=fixture-file-staging
           mkdir -p "$E1_FIXTURE_DIR/supabase/migrations"
           cp "$CANDIDATE_DIR/supabase/config.toml" "$E1_FIXTURE_DIR/supabase/config.toml"
           cp "$CANDIDATE_DIR/supabase/migrations/00000000000000_e1_ci_fixture.sql" \
             "$E1_FIXTURE_DIR/supabase/migrations/00000000000000_e1_ci_fixture.sql"
+          e1_stage=fixture-file-inventory
           test "$(find "$E1_FIXTURE_DIR" -type f | wc -l)" -eq 2
+          e1_stage=fixture-symlink-inventory
           test -z "$(find "$E1_FIXTURE_DIR" -type l)"
-          grep -E '^# (tests|pass|fail|skipped) ' "$RUNNER_TEMP/e1-static.log"
+          grep -E '^# (tests|pass|fail|skipped) ' "$RUNNER_TEMP/e1-static.log" || echo 'INFO: test summary unavailable; assertions already passed'
           echo 'PASS: static checks and isolated two-file staging'
       - name: Pull and verify the exact synthetic database image
         env:
@@ -132,11 +141,11 @@ jobs:
           E1_ISOLATED_RUNTIME: '1'
         run: |
           set -euo pipefail
-          "$E1_TOOLS_DIR/node-v24.21.0-linux-x64/bin/node" --test \
+          "$E1_TOOLS_DIR/node-v24.21.0-linux-x64/bin/node" --test --test-reporter=tap \
             "$CANDIDATE_DIR/tests/e1-negative.test.mjs" > "$RUNNER_TEMP/e1-runtime.log" 2>&1 || {
             echo 'FAIL: synthetic SQL security scenarios; no runtime PASS'; exit 1;
           }
-          grep -E '^# (tests|pass|fail|skipped) ' "$RUNNER_TEMP/e1-runtime.log"
+          grep -E '^# (tests|pass|fail|skipped) ' "$RUNNER_TEMP/e1-runtime.log" || echo 'INFO: test summary unavailable; assertions already passed'
           echo 'PASS: synthetic SQL security scenarios only; no Production equivalence'
       - name: Remove this exact local stack and its data volumes
         if: ${{ always() && steps.bootstrap.outcome != 'skipped' && steps.stage.outcome == 'success' && steps.tools.outcome == 'success' }}

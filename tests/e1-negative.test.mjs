@@ -81,6 +81,9 @@ function validateWorkflow(text) {
   assert.match(clean, /--project-id h1-g1-e1-ci-disposable --no-backup/)
   assert.ok(!/stop[^\n]*--all/.test(clean))
   assert.ok(!/cat "\$RUNNER_TEMP\/e1-|set -x|--debug/.test(clean))
+  assert.equal([...clean.matchAll(/--test --test-reporter=tap/g)].length, 2, 'Both test steps require stable TAP reporting')
+  assert.equal([...clean.matchAll(/\|\| echo 'INFO: test summary unavailable; assertions already passed'/g)].length, 2, 'Informational summaries must not fail passing assertions')
+  assert.match(clean, /FAIL: static\/staging stage=%s line=%s/)
 }
 
 function validateConfig(text) {
@@ -217,6 +220,9 @@ if (runtimeFlag !== '1') {
       ['broad cleanup', (text) => text.replace('--project-id h1-g1-e1-ci-disposable --no-backup', '--all --no-backup')],
       ['cache upload', (text) => text + '\n      - uses: actions/cache@main\n'],
       ['Production key', (text) => text + '\n      TOKEN: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}\n'],
+      ['implicit test reporter', (text) => text.replaceAll('--test --test-reporter=tap', '--test')],
+      ['fatal informational summary', (text) => text.replaceAll(" || echo 'INFO: test summary unavailable; assertions already passed'", '')],
+      ['missing stage diagnostics', (text) => text.replace('FAIL: static/staging stage=%s line=%s', 'failure')],
     ]) test(`workflow rejects ${name}`, () => assert.throws(() => validateWorkflow(mutate(workflow))))
     for (const [name, mutate] of [
       ['remote', (text) => text + '\n[remotes.main]\nproject_id = "actual-project"\n'],
