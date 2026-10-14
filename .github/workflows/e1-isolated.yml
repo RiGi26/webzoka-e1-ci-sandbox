@@ -141,11 +141,15 @@ jobs:
           E1_ISOLATED_RUNTIME: '1'
         run: |
           set -euo pipefail
+          e1_runtime_exit=0
           "$E1_TOOLS_DIR/node-v24.21.0-linux-x64/bin/node" --test --test-reporter=tap \
-            "$CANDIDATE_DIR/tests/e1-negative.test.mjs" > "$RUNNER_TEMP/e1-runtime.log" 2>&1 || {
-            echo 'FAIL: synthetic SQL security scenarios; no runtime PASS'; exit 1;
-          }
-          grep -E '^# (tests|pass|fail|skipped) ' "$RUNNER_TEMP/e1-runtime.log" || echo 'INFO: test summary unavailable; assertions already passed'
+            "$CANDIDATE_DIR/tests/e1-negative.test.mjs" > "$RUNNER_TEMP/e1-runtime.log" 2>&1 || e1_runtime_exit=$?
+          "$E1_TOOLS_DIR/node-v24.21.0-linux-x64/bin/node" "$CANDIDATE_DIR/tests/e1-negative.test.mjs" \
+            --safe-runtime-summary "$RUNNER_TEMP/e1-runtime.log" "$e1_runtime_exit"
+          if [ "$e1_runtime_exit" -ne 0 ]; then
+            echo 'FAIL: synthetic SQL security scenarios; no runtime PASS'
+            exit "$e1_runtime_exit"
+          fi
           echo 'PASS: synthetic SQL security scenarios only; no Production equivalence'
       - name: Remove this exact local stack and its data volumes
         if: ${{ always() && steps.bootstrap.outcome != 'skipped' && steps.stage.outcome == 'success' && steps.tools.outcome == 'success' }}

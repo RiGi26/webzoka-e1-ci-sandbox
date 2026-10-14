@@ -9,6 +9,81 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { before, describe, test } from 'node:test'
 
+// Diagnostics contain only fixed identifiers, outcome enums and SQLSTATE classes.
+function summarizeRuntimeDiagnostics(text) {
+  const ids = [...Array.from({ length: 10 }, (_, i) => `P${String(i).padStart(2, '0')}`),
+    ...Array.from({ length: 50 }, (_, i) => `T${String(i + 1).padStart(2, '0')}`)]
+  const records = new Map(ids.map((id) => [id, { id, status: 'NOT_EXECUTED', sqlstate_category: 'NONE', exit_status: 'NONE' }]))
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*# E1_DIAG (\{.*\})$/)
+    if (!match) continue
+    const item = JSON.parse(match[1])
+    assert.deepEqual(Object.keys(item).sort(), ['exit_status', 'id', 'sqlstate_category', 'status'])
+    assert.ok(records.has(item.id))
+    assert.ok(['START', 'PASS', 'FAIL'].includes(item.status))
+    assert.ok(item.sqlstate_category === 'NONE' || item.sqlstate_category === 'UNKNOWN' ||
+      (typeof item.sqlstate_category === 'string' && item.sqlstate_category.length === 2 && /^[0-9A-Z]{2}$/.test(item.sqlstate_category)))
+    assert.ok(['NONE', 'OK', 'SQL_ERROR', 'TOOL_ERROR', 'SPAWN_FAILURE'].includes(item.exit_status))
+    const prior = records.get(item.id)
+    assert.ok(prior.status === 'NOT_EXECUTED' || prior.status === 'START', 'Duplicate terminal diagnostic')
+    records.set(item.id, item)
+  }
+  const items = [...records.values()].map((item) => item.status === 'START' ? { ...item, status: 'FAIL' } : item)
+  const tests = items.filter((item) => item.id.startsWith('T'))
+  return { records: items, counters: {
+    executed: tests.filter((item) => item.status !== 'NOT_EXECUTED').length,
+    passed: tests.filter((item) => item.status === 'PASS').length,
+    failed: tests.filter((item) => item.status === 'FAIL').length,
+    not_executed: tests.filter((item) => item.status === 'NOT_EXECUTED').length,
+  } }
+}
+
+if (process.argv[2] === '--safe-runtime-summary') {
+  try {
+    assert.equal(process.argv.length, 5)
+    assert.match(process.argv[4], /^(0|[1-9][0-9]{0,2})$/)
+    assert.ok(Number(process.argv[4]) <= 255)
+    assert.ok(process.env.RUNNER_TEMP)
+    const logPath = process.argv[3]
+    assert.equal(resolve(logPath), resolve(process.env.RUNNER_TEMP, 'e1-runtime.log'))
+    assert.equal(lstatSync(logPath).isSymbolicLink(), false)
+    const summary = summarizeRuntimeDiagnostics(readFileSync(logPath, 'utf8'))
+    if (summary.records.every((item) => item.status === 'NOT_EXECUTED')) console.log('E1_PRETEST_NO_SAFE_RECORDS')
+    for (const item of summary.records) console.log(`E1_CHECK ${JSON.stringify(item)}`)
+    console.log(`E1_COUNTERS ${JSON.stringify(summary.counters)}`)
+    if (process.argv[4] === '0' && summary.records.some((item) => item.status !== 'PASS')) {
+      console.log('E1_RUNTIME_INCOMPLETE')
+      process.exit(1)
+    }
+    process.exit(0)
+  } catch {
+    console.log('E1_SAFE_DIAGNOSTICS_INVALID')
+    process.exit(1)
+  }
+}
+
+let runtimeSqlDiagnostic = { sqlstate_category: 'NONE', exit_status: 'NONE' }
+function emitRuntimeDiagnostic(id, status) {
+  console.log(`E1_DIAG ${JSON.stringify({ id, status, ...runtimeSqlDiagnostic })}`)
+}
+function runtimeCheck(id, body, emit = emitRuntimeDiagnostic) {
+  runtimeSqlDiagnostic = { sqlstate_category: 'NONE', exit_status: 'NONE' }
+  emit(id, 'START')
+  try {
+    const result = body()
+    emit(id, 'PASS')
+    return result
+  } catch (error) {
+    emit(id, 'FAIL')
+    throw error
+  }
+}
+function sqlDiagnostic(result) {
+  const state = result.stderr?.match(/\b(?:ERROR|FATAL):\s+([0-9A-Z]{5}):/)?.[1]
+  return { sqlstate_category: result.status === 0 ? 'NONE' : state?.slice(0, 2) ?? 'UNKNOWN',
+    exit_status: result.status === 0 ? 'OK' : result.status === 3 ? 'SQL_ERROR' : result.status === null ? 'SPAWN_FAILURE' : 'TOOL_ERROR' }
+}
+
 const candidate = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const root = candidate
 const project = 'h1-g1-e1-ci-disposable'
@@ -22,14 +97,15 @@ const files = [
   'tests/e1-negative.test.mjs', 'tests/codec-vectors.json', 'README.md',
 ]
 const read = (path) => readFileSync(join(candidate, path), 'utf8')
-const workflow = read(files[0])
-const config = read(files[1])
-const fixture = read(files[2])
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const vectorBytes = readFileSync(join(candidate, 'tests/codec-vectors.json'))
-assert.equal(sha256(vectorBytes), 'ffa5f63571f4d4429644fe62c54d37c54b0407065375c0a390994dbdfedac407', 'Reviewed codec vectors must not drift')
-const vectors = JSON.parse(vectorBytes)
+const loadInputs = () => {
+  const vectorBytes = readFileSync(join(candidate, 'tests/codec-vectors.json'))
+  assert.equal(sha256(vectorBytes), 'ffa5f63571f4d4429644fe62c54d37c54b0407065375c0a390994dbdfedac407', 'Reviewed codec vectors must not drift')
+  return { workflow: read(files[0]), config: read(files[1]), fixture: read(files[2]), vectors: JSON.parse(vectorBytes) }
+}
+const { workflow, config, fixture, vectors } = process.env.E1_ISOLATED_RUNTIME === '1'
+  ? runtimeCheck('P00', loadInputs) : loadInputs()
 
 // Lexical security gates, not a YAML/TOML/SQL parser. Local parser validation is
 // separate (existing Python PyYAML and tomllib); GitHub/CLI parsing is unexecuted.
@@ -82,8 +158,11 @@ function validateWorkflow(text) {
   assert.ok(!/stop[^\n]*--all/.test(clean))
   assert.ok(!/cat "\$RUNNER_TEMP\/e1-|set -x|--debug/.test(clean))
   assert.equal([...clean.matchAll(/--test --test-reporter=tap/g)].length, 2, 'Both test steps require stable TAP reporting')
-  assert.equal([...clean.matchAll(/\|\| echo 'INFO: test summary unavailable; assertions already passed'/g)].length, 2, 'Informational summaries must not fail passing assertions')
+  assert.equal([...clean.matchAll(/\|\| echo 'INFO: test summary unavailable; assertions already passed'/g)].length, 1, 'Informational static summary must not fail passing assertions')
   assert.match(clean, /FAIL: static\/staging stage=%s line=%s/)
+  assert.match(clean, /--safe-runtime-summary "\$RUNNER_TEMP\/e1-runtime.log" "\$e1_runtime_exit"/)
+  assert.match(clean, /\|\| e1_runtime_exit=\$\?/)
+  assert.match(clean, /exit "\$e1_runtime_exit"/)
 }
 
 function validateConfig(text) {
@@ -152,6 +231,14 @@ function validateRuntimeEnvelope(env) {
   }
 }
 
+function validateContainerMetadata(metadata) {
+  assert.equal(metadata.Name, `/${container}`)
+  assert.equal(metadata.State.Running, true)
+  assert.equal(metadata.Config.Labels['com.supabase.cli.project'], project)
+  // The pinned CLI sets these two project labels; it has no workdir label.
+  assert.equal(metadata.Config.Labels['com.docker.compose.project'], project)
+}
+
 function strictReference(actor, key, name) {
   assert.ok(typeof actor === 'string' && actor.length === 36 && uuidPattern.test(actor))
   assert.ok(typeof key === 'string' && key.length === 36 && uuidPattern.test(key))
@@ -173,6 +260,40 @@ assert.ok(runtimeFlag === undefined || runtimeFlag === '0' || runtimeFlag === '1
 
 if (runtimeFlag !== '1') {
   describe('STATIC_ONLY: no SQL, CLI, Docker, network or provider calls', () => {
+    test('pinned CLI project labels identify the exact running fixture container', () => {
+      const metadata = { Name: `/${container}`, State: { Running: true }, Config: { Labels: {
+        'com.supabase.cli.project': project, 'com.docker.compose.project': project,
+      } } }
+      validateContainerMetadata(metadata)
+      for (const mutate of [
+        (value) => { value.Name = '/foreign' }, (value) => { value.State.Running = false },
+        (value) => { value.Config.Labels['com.supabase.cli.project'] = 'foreign' },
+        (value) => { value.Config.Labels['com.docker.compose.project'] = 'foreign' },
+      ]) { const value = structuredClone(metadata); mutate(value); assert.throws(() => validateContainerMetadata(value)) }
+    })
+    test('diagnostic wrapper preserves real assertion failures and records their stable identifier', () => {
+      const events = []
+      const error = new Error('synthetic private diagnostic marker')
+      assert.throws(() => runtimeCheck('T01', () => { throw error }, (id, status) => events.push({ id, status })), (actual) => actual === error)
+      assert.deepEqual(events, [{ id: 'T01', status: 'START' }, { id: 'T01', status: 'FAIL' }])
+    })
+    test('safe runtime summaries exclude raw SQL, messages, URLs and arbitrary fields', () => {
+      const record = { id: 'T01', status: 'FAIL', sqlstate_category: '42', exit_status: 'SQL_ERROR' }
+      const summary = summarizeRuntimeDiagnostics(`SQL SECRET_MARKER\n# E1_DIAG ${JSON.stringify(record)}\npostgres stderr SECRET_MARKER`)
+      assert.equal(JSON.stringify(summary).includes('SECRET_MARKER'), false)
+      assert.deepEqual(summary.counters, { executed: 1, passed: 0, failed: 1, not_executed: 49 })
+      for (const value of [{ ...record, message: 'SECRET_MARKER' }, { ...record, id: 'SECRET_MARKER' },
+        { ...record, sqlstate_category: 'SECRET_MARKER' }, { ...record, exit_status: 'SECRET_MARKER' }]) {
+        assert.throws(() => summarizeRuntimeDiagnostics(`# E1_DIAG ${JSON.stringify(value)}`))
+      }
+    })
+    test('pre-test diagnostics keep SQL tests not executed and sanitize SQLSTATE categories', () => {
+      const item = { id: 'P01', status: 'FAIL', sqlstate_category: 'NONE', exit_status: 'NONE' }
+      const summary = summarizeRuntimeDiagnostics(`# E1_DIAG ${JSON.stringify(item)}`)
+      assert.deepEqual(summary.counters, { executed: 0, passed: 0, failed: 0, not_executed: 50 })
+      assert.deepEqual(sqlDiagnostic({ status: 3, stderr: 'ERROR:  42501: SECRET_MARKER' }), { sqlstate_category: '42', exit_status: 'SQL_ERROR' })
+      assert.equal(JSON.stringify(sqlDiagnostic({ status: 1, stderr: 'SECRET_MARKER' })).includes('SECRET_MARKER'), false)
+    })
     test('workflow gates exact branch, paths, commit, human environment and one attempt', () => validateWorkflow(workflow))
     test('configuration isolates one project, migration directory and disabled services', () => validateConfig(config))
     test('synthetic fixture restricts roles and always refuses the writer', () => validateFixture(fixture))
@@ -223,6 +344,8 @@ if (runtimeFlag !== '1') {
       ['implicit test reporter', (text) => text.replaceAll('--test --test-reporter=tap', '--test')],
       ['fatal informational summary', (text) => text.replaceAll(" || echo 'INFO: test summary unavailable; assertions already passed'", '')],
       ['missing stage diagnostics', (text) => text.replace('FAIL: static/staging stage=%s line=%s', 'failure')],
+      ['missing safe runtime diagnostics', (text) => text.replace('--safe-runtime-summary "$RUNNER_TEMP/e1-runtime.log"', '--raw-runtime-log')],
+      ['discarded runtime failure exit', (text) => text.replace('|| e1_runtime_exit=$?', '|| true')],
     ]) test(`workflow rejects ${name}`, () => assert.throws(() => validateWorkflow(mutate(workflow))))
     for (const [name, mutate] of [
       ['remote', (text) => text + '\n[remotes.main]\nproject_id = "actual-project"\n'],
@@ -267,26 +390,35 @@ if (runtimeFlag !== '1') {
     })
   })
 } else {
-  validateRuntimeEnvelope(process.env)
-  assert.equal(realpathSync(process.env.E1_FIXTURE_DIR), resolve(process.env.E1_FIXTURE_DIR))
-  assert.equal(sha256(readFileSync(join(process.env.E1_FIXTURE_DIR, 'supabase/config.toml'))), sha256(config))
-  assert.equal(sha256(readFileSync(join(process.env.E1_FIXTURE_DIR, files[2]))), sha256(fixture))
+  runtimeCheck('P01', () => validateRuntimeEnvelope(process.env))
+  runtimeCheck('P02', () => assert.equal(realpathSync(process.env.E1_FIXTURE_DIR), resolve(process.env.E1_FIXTURE_DIR)))
+  runtimeCheck('P03', () => {
+    assert.equal(sha256(readFileSync(join(process.env.E1_FIXTURE_DIR, 'supabase/config.toml'))), sha256(config))
+    assert.equal(sha256(readFileSync(join(process.env.E1_FIXTURE_DIR, files[2]))), sha256(fixture))
+  })
   const docker = (args, input) => spawnSync('docker', args, {
     input, encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
   })
-  const inspect = docker(['inspect', container])
-  assert.equal(inspect.status, 0, 'Exact disposable container must exist')
-  const metadata = JSON.parse(inspect.stdout)[0]
-  assert.equal(metadata.Name, `/${container}`)
-  assert.equal(metadata.State.Running, true)
-  assert.equal(metadata.Config.Labels['com.supabase.cli.project'], project)
-  assert.equal(metadata.Config.Labels['com.supabase.cli.workdir'], process.env.E1_FIXTURE_DIR)
-  const image = docker(['image', 'inspect', `supabase/postgres@${imageDigest}`])
-  assert.equal(image.status, 0)
-  assert.equal(metadata.Image, JSON.parse(image.stdout)[0].Id, 'Database must use the reviewed image digest')
-  const sql = (query) => docker(['exec', '--user', 'postgres', '-i', container, 'psql',
-    '-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose',
-    '--host=/var/run/postgresql', '--username=postgres', '--dbname=postgres'], query)
+  const metadata = runtimeCheck('P04', () => {
+    const inspect = docker(['inspect', container])
+    runtimeSqlDiagnostic = { sqlstate_category: 'NONE', exit_status: inspect.status === 0 ? 'OK' : inspect.status === null ? 'SPAWN_FAILURE' : 'TOOL_ERROR' }
+    assert.equal(inspect.status, 0, 'Exact disposable container must exist')
+    return JSON.parse(inspect.stdout)[0]
+  })
+  runtimeCheck('P05', () => validateContainerMetadata(metadata))
+  runtimeCheck('P06', () => {
+    const image = docker(['image', 'inspect', `supabase/postgres@${imageDigest}`])
+    runtimeSqlDiagnostic = { sqlstate_category: 'NONE', exit_status: image.status === 0 ? 'OK' : image.status === null ? 'SPAWN_FAILURE' : 'TOOL_ERROR' }
+    assert.equal(image.status, 0)
+    assert.equal(metadata.Image, JSON.parse(image.stdout)[0].Id, 'Database must use the reviewed image digest')
+  })
+  const sql = (query) => {
+    const result = docker(['exec', '--user', 'postgres', '-i', container, 'psql',
+      '-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose',
+      '--host=/var/run/postgresql', '--username=postgres', '--dbname=postgres'], query)
+    runtimeSqlDiagnostic = sqlDiagnostic(result)
+    return result
+  }
   const query = (text) => {
     const result = sql(text)
     assert.equal(result.status, 0, 'Isolated SQL assertion failed; raw diagnostics are not emitted')
@@ -308,41 +440,46 @@ if (runtimeFlag !== '1') {
   }
   const snapshotSql = "select jsonb_build_object('identities', (select jsonb_agg(t order by id) from e1_ci.synthetic_identities t), 'companies', (select jsonb_agg(t order by id) from e1_ci.companies t), 'memberships', (select jsonb_agg(t order by actor_id, company_id) from e1_ci.memberships t), 'history', (select jsonb_agg(t order by actor_id) from e1_ci.legacy_history t))::text"
   let snapshot
+  let runtimeTestIndex = 0
+  const runtimeTest = (name, body) => {
+    const id = `T${String(++runtimeTestIndex).padStart(2, '0')}`
+    return test(`[${id}] ${name}`, () => runtimeCheck(id, body))
+  }
   describe('ISOLATED_SQL_ONLY: synthetic roles/GUCs, not Core Auth or Production', { concurrency: false }, () => {
     before(() => {
-      assert.equal(query("select obj_description('e1_ci.synthetic_identities'::regclass)"), 'H1_G1_E1_SYNTHETIC_DISPOSABLE_V1')
-      assert.equal(query("select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname in ('companies','tenants','customer_onboarding','invoices','subscriptions','payments')"), '0')
-      snapshot = query(snapshotSql)
+      runtimeCheck('P07', () => assert.equal(query("select obj_description('e1_ci.synthetic_identities'::regclass)"), 'H1_G1_E1_SYNTHETIC_DISPOSABLE_V1'))
+      runtimeCheck('P08', () => assert.equal(query("select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname in ('companies','tenants','customer_onboarding','invoices','subscriptions','payments')"), '0'))
+      runtimeCheck('P09', () => { snapshot = query(snapshotSql) })
     })
-    test('effective reader role lacks login, inheritance, bypass and administrative privileges', () => {
+    runtimeTest('effective reader role lacks login, inheritance, bypass and administrative privileges', () => {
       assert.equal(query("select not rolcanlogin and not rolinherit and not rolbypassrls and not rolsuper and not rolcreatedb and not rolcreaterole and not rolreplication from pg_roles where rolname='e1_ci_reader'"), 't')
       assert.equal(query("select bool_and(not pg_has_role(oid, 'e1_ci_reader', 'MEMBER')) from pg_roles where rolname in ('anon','authenticated','service_role')"), 't')
     })
-    test('all four fixture tables enforce RLS and have no granted client mutation privilege', () => {
+    runtimeTest('all four fixture tables enforce RLS and have no granted client mutation privilege', () => {
       assert.equal(query("select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='e1_ci' and c.relkind='r' and c.relrowsecurity and c.relforcerowsecurity"), '4')
       for (const role of ['anon', 'authenticated', 'service_role', 'e1_ci_reader']) {
         assert.equal(query(`select bool_and(not has_table_privilege(${quoted(role)}, c.oid, 'INSERT,UPDATE,DELETE,TRUNCATE')) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='e1_ci' and c.relkind='r'`), 't')
       }
     })
-    for (const role of ['anon', 'authenticated', 'service_role']) test(`${role}: Company data inaccessible despite a claimed actor`, () => {
+    for (const role of ['anon', 'authenticated', 'service_role']) runtimeTest(`${role}: Company data inaccessible despite a claimed actor`, () => {
       denied(withRole(role, actor(1), 'select id from e1_ci.companies'))
     })
-    test('synthetic read predicate isolates Company A and B; this is not authenticated actor proof', () => {
+    runtimeTest('synthetic read predicate isolates Company A and B; this is not authenticated actor proof', () => {
       assert.equal(query(withRole('e1_ci_reader', actor(1), 'select id from e1_ci.companies')), company(1))
       assert.equal(query(withRole('e1_ci_reader', actor(2), 'select id from e1_ci.companies')), company(2))
       assert.equal(query(withRole('e1_ci_reader', actor(1), `select count(*) from e1_ci.companies where id=${quoted(company(2))}`)), '0')
     })
     for (const [index, label] of [[3, 'revoked membership'], [4, 'inactive Company'], [5, 'ambiguous memberships'],
       [6, 'legacy conflict'], [7, 'synthetic anonymous identity'], [8, 'synthetic revoked identity']]) {
-      test(`${label}: zero readable Companies`, () => assert.equal(query(withRole('e1_ci_reader', actor(index), 'select count(*) from e1_ci.companies')), '0'))
+      runtimeTest(`${label}: zero readable Companies`, () => assert.equal(query(withRole('e1_ci_reader', actor(index), 'select count(*) from e1_ci.companies')), '0'))
     }
-    test('missing synthetic actor denies reads', () => assert.equal(query(withRole('e1_ci_reader', '', 'select count(*) from e1_ci.companies')), '0'))
+    runtimeTest('missing synthetic actor denies reads', () => assert.equal(query(withRole('e1_ci_reader', '', 'select count(*) from e1_ci.companies')), '0'))
     for (const role of ['anon', 'authenticated', 'e1_ci_reader']) {
-      test(`${role}: missing trusted transport always refuses workspace creation`, () => {
+      runtimeTest(`${role}: missing trusted transport always refuses workspace creation`, () => {
         denied(withRole(role, actor(1), `select e1_ci.request_workspace_disabled('Synthetic New Company', ${quoted(vectors.valid[0].key)}::uuid)`), 'REVIEW_REQUIRED_IDENTITY_TRANSPORT')
       })
       for (const argument of [`p_actor => ${quoted(actor(2))}::uuid`, `p_company => ${quoted(company(2))}::uuid`, "p_role => 'owner'", `p_source_ref => ${quoted(vectors.valid[0].key)}::uuid`]) {
-        test(`${role}: client-controlled actor, Company, role or source cannot grant creation authority`, () => {
+        runtimeTest(`${role}: client-controlled actor, Company, role or source cannot grant creation authority`, () => {
           denied(withRole(role, actor(1), `select e1_ci.request_workspace_disabled('Synthetic New Company', ${quoted(vectors.valid[0].key)}::uuid, ${argument})`), 'CLIENT_IDENTITY_DENIED')
         })
       }
@@ -354,23 +491,23 @@ if (runtimeFlag !== '1') {
       [actor(1), company(1), 'ACTOR_SOURCE_CONTINUITY_DENIED'],
       [null, source, 'ACTOR_SOURCE_CONTINUITY_DENIED'],
       [actor(1), null, 'ACTOR_SOURCE_CONTINUITY_DENIED'],
-    ]) test('UUID continuity contract remains fail-closed without any actual lock or session transport', () => {
+    ]) runtimeTest('UUID continuity contract remains fail-closed without any actual lock or session transport', () => {
       const literal = (value) => value === null ? 'null::uuid' : `${quoted(value)}::uuid`
       denied(withRole('e1_ci_reader', actor(1), `select e1_ci.assert_continuity_disabled(${literal(actor(1))}, ${literal(currentActor)}, ${literal(source)}, ${literal(currentSource)})`), marker)
     })
-    for (const [index, vector] of vectors.valid.entries()) test(`PostgreSQL projection versus shared TypeScript codec vector ${index}`, () => {
+    for (const [index, vector] of vectors.valid.entries()) runtimeTest(`PostgreSQL projection versus shared TypeScript codec vector ${index}`, () => {
       const name = `convert_from(decode('${Buffer.from(vector.input, 'utf8').toString('hex')}', 'hex'), 'UTF8')`
       const actual = JSON.parse(query(`select e1_ci.codec_projection(${quoted(vector.subject)}::uuid, ${quoted(vector.key)}::uuid, ${name})::text`))
       assert.deepEqual(actual, strictReference(vector.subject, vector.key, vector.input))
     })
     for (const key of [vectors.valid[0].key.replaceAll('-', ''), `{${vectors.valid[0].key}}`, '00000000-0000-0000-0000-000000000000']) {
-      test('typed PostgreSQL UUID domain is broader than the strict TypeScript string gate', () => {
+      runtimeTest('typed PostgreSQL UUID domain is broader than the strict TypeScript string gate', () => {
         assert.throws(() => strictReference(vectors.valid[0].subject, key, 'Synthetic Company'))
         assert.ok(query(`select ${quoted(key)}::uuid::text`))
         denied(withRole('e1_ci_reader', actor(1), `select e1_ci.request_workspace_disabled('Synthetic Company', ${quoted(key)}::uuid)`), 'REVIEW_REQUIRED_IDENTITY_TRANSPORT')
       })
     }
-    test('PostgreSQL UTF8 rejects NUL and surrogate encoding; JS invalid-scalar rejection is a separate gate', () => {
+    runtimeTest('PostgreSQL UTF8 rejects NUL and surrogate encoding; JS invalid-scalar rejection is a separate gate', () => {
       for (const bytes of ['410042', '41eda08042']) {
         const result = sql(`select convert_from(decode('${bytes}', 'hex'), 'UTF8')`)
         assert.equal(result.status, 3)
@@ -383,8 +520,8 @@ if (runtimeFlag !== '1') {
       `delete from e1_ci.companies where id=${quoted(company(1))}`,
       'truncate e1_ci.companies',
       `update e1_ci.memberships set role='owner' where actor_id=${quoted(actor(2))}`,
-    ]) test('fixture client cannot mutate Company or Owner relationships', () => denied(withRole('e1_ci_reader', actor(1), operation)))
-    test('fixture contains no financial, subscription, trial or portal table and records remain identical', () => {
+    ]) runtimeTest('fixture client cannot mutate Company or Owner relationships', () => denied(withRole('e1_ci_reader', actor(1), operation)))
+    runtimeTest('fixture contains no financial, subscription, trial or portal table and records remain identical', () => {
       assert.deepEqual(JSON.parse(query("select jsonb_agg(relname order by relname)::text from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='e1_ci' and c.relkind='r'")), [
         'companies', 'legacy_history', 'memberships', 'synthetic_identities',
       ])
