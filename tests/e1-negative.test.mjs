@@ -11,7 +11,7 @@ import { before, describe, test } from 'node:test'
 
 // Diagnostics contain only fixed identifiers, outcome enums and SQLSTATE classes.
 function summarizeRuntimeDiagnostics(text) {
-  const ids = [...Array.from({ length: 10 }, (_, i) => `P${String(i).padStart(2, '0')}`),
+  const ids = [...Array.from({ length: 17 }, (_, i) => `P${String(i).padStart(2, '0')}`),
     ...Array.from({ length: 50 }, (_, i) => `T${String(i + 1).padStart(2, '0')}`)]
   const records = new Map(ids.map((id) => [id, { id, status: 'NOT_EXECUTED', sqlstate_category: 'NONE', exit_status: 'NONE' }]))
   for (const line of text.split(/\r?\n/)) {
@@ -239,6 +239,92 @@ function validateContainerMetadata(metadata) {
   assert.equal(metadata.Config.Labels['com.docker.compose.project'], project)
 }
 
+// PostgreSQL 17 gives a non-superuser role creator ADMIN, but not SET/INHERIT.
+// These queries run only after the exact disposable fixture has been verified.
+const readerRoleSql = {
+  supervisor: `select current_database() = 'postgres' and session_user = 'postgres' and current_user = session_user
+    and current_setting('server_version_num')::integer between 170000 and 179999
+    and (select not rolsuper and rolcreaterole and rolcanlogin from pg_roles where rolname = current_user)`,
+  initialMembership: `select not pg_has_role(session_user, 'e1_ci_reader', 'SET')
+    and not pg_has_role(session_user, 'e1_ci_reader', 'USAGE')
+    and (select not rolcanlogin and not rolinherit and not rolsuper and not rolcreatedb and not rolcreaterole
+      and not rolreplication and not rolbypassrls from pg_roles where rolname = 'e1_ci_reader')
+    and (select bool_and(m.member = (select oid from pg_roles where rolname = session_user)
+      and m.admin_option and not m.inherit_option and not m.set_option)
+      from pg_auth_members m where m.roleid = (select oid from pg_roles where rolname = 'e1_ci_reader'))
+    and not exists (select 1 from pg_auth_members where member = (select oid from pg_roles where rolname = 'e1_ci_reader'))`,
+  initialSwitch: 'begin; set local role e1_ci_reader; rollback;',
+  grant: 'grant e1_ci_reader to postgres with admin false, inherit false, set true',
+  repairedMembership: `select pg_has_role(session_user, 'e1_ci_reader', 'SET')
+    and not pg_has_role(session_user, 'e1_ci_reader', 'USAGE')
+    and (select bool_and(member = (select oid from pg_roles where rolname = 'postgres') and not inherit_option)
+      from pg_auth_members where roleid = (select oid from pg_roles where rolname = 'e1_ci_reader'))
+    and exists (select 1 from pg_auth_members where roleid = (select oid from pg_roles where rolname = 'e1_ci_reader')
+      and member = (select oid from pg_roles where rolname = 'postgres')
+      and grantor = (select oid from pg_roles where rolname = 'postgres')
+      and set_option and not inherit_option and not admin_option)`,
+  privileges: `select has_schema_privilege('e1_ci_reader', 'e1_ci', 'USAGE')
+    and not has_schema_privilege('e1_ci_reader', 'e1_ci', 'CREATE')
+    and (select bool_and(has_table_privilege('e1_ci_reader', c.oid, 'SELECT')
+      and not has_table_privilege('e1_ci_reader', c.oid, 'INSERT,UPDATE,DELETE,TRUNCATE'))
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'e1_ci' and c.relkind = 'r')
+    and has_function_privilege('e1_ci_reader', 'e1_ci.synthetic_actor()', 'EXECUTE')
+    and has_function_privilege('e1_ci_reader', 'e1_ci.request_workspace_disabled(text,uuid,uuid,uuid,text,uuid)', 'EXECUTE')
+    and has_function_privilege('e1_ci_reader', 'e1_ci.assert_continuity_disabled(uuid,uuid,uuid,uuid)', 'EXECUTE')
+    and not has_function_privilege('e1_ci_reader', 'e1_ci.codec_projection(uuid,uuid,text)', 'EXECUTE')`,
+}
+
+function withSyntheticRole(role, identity, statement) {
+  assert.ok(['anon', 'authenticated', 'service_role', 'e1_ci_reader'].includes(role))
+  assert.ok(identity === '' || uuidPattern.test(identity))
+  const guard = role === 'e1_ci_reader' ? `do $e1_reader_guard$ begin
+    if current_user <> 'e1_ci_reader' then
+      raise exception using errcode = '42501', message = 'E1_READER_ROLE_REQUIRED';
+    end if;
+  end; $e1_reader_guard$; ` : ''
+  return `begin; set local role ${role}; set local e1_ci.actor = '${identity}'; ${guard}${statement}; rollback;`
+}
+
+function assertAuthorizationDenial(result, marker) {
+  assert.equal(result.status, 3, 'Expected psql ON_ERROR_STOP authorization denial')
+  assert.match(result.stderr, /\b(?:ERROR|FATAL):\s+42501:/, 'Expected authorization SQLSTATE, not another SQL error')
+  if (marker) assert.ok(result.stderr.includes(marker), 'Expected the specific security boundary')
+}
+
+function prepareReaderRoleSwitch(query, denied, check = runtimeCheck) {
+  check('P10', () => assert.equal(query(readerRoleSql.supervisor), 't', 'Verified isolated PostgreSQL 17 supervisor required'))
+  check('P11', () => assert.equal(query(readerRoleSql.initialMembership), 't', 'Expected restricted reader and creator membership required'))
+  // The only privileged statement here is SET ROLE. No grant occurs unless its
+  // actual 42501 denial is proved, independently of the prior class-42 evidence.
+  check('P12', () => denied(readerRoleSql.initialSwitch))
+  check('P13', () => assert.equal(query(readerRoleSql.grant), '', 'Apply only the verified supervisor SET grant'))
+  check('P14', () => assert.equal(query(readerRoleSql.repairedMembership), 't', 'SET-only membership to postgres required'))
+  check('P15', () => assert.equal(query(withSyntheticRole('e1_ci_reader', '',
+    "select current_user = 'e1_ci_reader' and session_user = 'postgres' and (select not rolcanlogin and not rolbypassrls and not rolsuper from pg_roles where rolname = current_user)")), 't', 'Effective reader role must be proved'))
+  check('P16', () => assert.equal(query(readerRoleSql.privileges), 't', 'Reader schema/table/function privileges must remain restricted'))
+}
+
+function mutationDenialStatement(id, identity) {
+  const operations = {
+    T45: "insert into e1_ci.companies values ('20000000-0000-4000-8000-000000000009','Synthetic Attempt','active')",
+    T46: "update e1_ci.companies set name='Synthetic Attempt' where id='20000000-0000-4000-8000-000000000001'",
+    T47: "delete from e1_ci.companies where id='20000000-0000-4000-8000-000000000001'",
+    T48: 'truncate e1_ci.companies',
+    T49: "update e1_ci.memberships set role='owner' where actor_id='10000000-0000-4000-8000-000000000002'",
+  }
+  assert.ok(Object.hasOwn(operations, id), 'Only the five reviewed synthetic mutation targets are permitted')
+  const marker = `E1_MUTATION_${id}_DENIED`
+  // The reader guard is outside this exception handler. Only the intended
+  // operation's 42501 is translated to its fixed marker; success fails closed.
+  const statement = `do $e1_mutation$ begin
+    ${operations[id]};
+    raise exception using errcode = 'P0001', message = 'E1_MUTATION_WAS_ALLOWED';
+  exception when insufficient_privilege then
+    raise exception using errcode = '42501', message = '${marker}';
+  end; $e1_mutation$`
+  return { sql: withSyntheticRole('e1_ci_reader', identity, statement), marker }
+}
+
 function strictReference(actor, key, name) {
   assert.ok(typeof actor === 'string' && actor.length === 36 && uuidPattern.test(actor))
   assert.ok(typeof key === 'string' && key.length === 36 && uuidPattern.test(key))
@@ -260,6 +346,70 @@ assert.ok(runtimeFlag === undefined || runtimeFlag === '0' || runtimeFlag === '1
 
 if (runtimeFlag !== '1') {
   describe('STATIC_ONLY: no SQL, CLI, Docker, network or provider calls', () => {
+    test('reader setup refuses mutation for an unverified supervisor or initial membership', () => {
+      for (const rejected of [readerRoleSql.supervisor, readerRoleSql.initialMembership]) {
+        const queries = []
+        assert.throws(() => prepareReaderRoleSwitch((statement) => {
+          queries.push(statement)
+          return statement === rejected ? 'f' : 't'
+        }, () => {}, (_id, body) => body()))
+        assert.equal(queries.includes(readerRoleSql.grant), false)
+      }
+    })
+    test('reader setup refuses a grant unless the initial SET ROLE denial is actually proved', () => {
+      const queries = []
+      assert.throws(() => prepareReaderRoleSwitch((statement) => { queries.push(statement); return 't' },
+        () => assertAuthorizationDenial({ status: 0, stderr: '' }), (_id, body) => body()))
+      assert.equal(queries.includes(readerRoleSql.grant), false)
+    })
+    test('verified reader setup grants only SET and requires effective identity and privileges', () => {
+      const stages = []
+      const queries = []
+      prepareReaderRoleSwitch((statement) => { queries.push(statement); return statement === readerRoleSql.grant ? '' : 't' },
+        (statement) => assert.equal(statement, readerRoleSql.initialSwitch), (id, body) => { stages.push(id); body() })
+      assert.deepEqual(stages, ['P10', 'P11', 'P12', 'P13', 'P14', 'P15', 'P16'])
+      assert.equal(queries.filter((statement) => /^grant /i.test(statement)).length, 1)
+      assert.equal(readerRoleSql.grant, 'grant e1_ci_reader to postgres with admin false, inherit false, set true')
+      assert.ok(queries.some((statement) => statement.includes("current_user = 'e1_ci_reader' and session_user = 'postgres'")))
+    })
+    test('reader setup fails closed if repaired membership, role switch or privileges are incorrect', () => {
+      for (const rejected of [readerRoleSql.repairedMembership, 'effective_reader', readerRoleSql.privileges]) {
+        assert.throws(() => prepareReaderRoleSwitch((statement) => {
+          if (statement === readerRoleSql.grant) return ''
+          return statement === rejected || (rejected === 'effective_reader' && statement.includes('set local role e1_ci_reader; set local')) ? 'f' : 't'
+        }, () => {}, (_id, body) => body()))
+      }
+    })
+    test('mutation-denial results reject role-switch failures, unrelated errors and allowed mutations', () => {
+      for (const id of ['T45', 'T46', 'T47', 'T48', 'T49']) {
+        const { marker } = mutationDenialStatement(id, '10000000-0000-4000-8000-000000000001')
+        assertAuthorizationDenial({ status: 3, stderr: `ERROR:  42501: ${marker}` }, marker)
+        for (const result of [{ status: 3, stderr: 'ERROR:  42501: permission denied to set role' },
+          { status: 3, stderr: 'ERROR:  42501: E1_READER_ROLE_REQUIRED' },
+          { status: 3, stderr: `ERROR:  23505: ${marker}` }, { status: 0, stderr: '' }]) {
+          assert.throws(() => assertAuthorizationDenial(result, marker))
+        }
+      }
+    })
+    test('reader mutation probes bind five reviewed targets and keep role proof outside denial handling', () => {
+      for (const id of ['T45', 'T46', 'T47', 'T48', 'T49']) {
+        const { sql, marker } = mutationDenialStatement(id, '10000000-0000-4000-8000-000000000001')
+        assert.ok(sql.indexOf('E1_READER_ROLE_REQUIRED') < sql.indexOf('do $e1_mutation$'))
+        assert.ok(sql.indexOf('E1_MUTATION_WAS_ALLOWED') < sql.indexOf('exception when insufficient_privilege'))
+        assert.match(sql, /errcode = 'P0001'/)
+        assert.ok(sql.includes(marker))
+      }
+      assert.throws(() => mutationDenialStatement('T50', '10000000-0000-4000-8000-000000000001'))
+      assert.throws(() => withSyntheticRole('supabase_admin', '', 'select 1'))
+      assert.throws(() => withSyntheticRole('e1_ci_reader', "'; grant all", 'select 1'))
+    })
+    test('new reader precondition diagnostics remain allowlisted without exposing identities or SQL', () => {
+      const summary = summarizeRuntimeDiagnostics('# E1_DIAG ' + JSON.stringify({ id: 'P12', status: 'PASS', sqlstate_category: '42', exit_status: 'SQL_ERROR' }))
+      assert.equal(summary.records.length, 67)
+      assert.equal(summary.records.find((item) => item.id === 'P12').status, 'PASS')
+      assert.deepEqual(summary.counters, { executed: 0, passed: 0, failed: 0, not_executed: 50 })
+      assert.throws(() => summarizeRuntimeDiagnostics('# E1_DIAG ' + JSON.stringify({ id: 'P17', status: 'PASS', sqlstate_category: 'NONE', exit_status: 'NONE' })))
+    })
     test('pinned CLI project labels identify the exact running fixture container', () => {
       const metadata = { Name: `/${container}`, State: { Running: true }, Config: { Labels: {
         'com.supabase.cli.project': project, 'com.docker.compose.project': project,
@@ -427,16 +577,10 @@ if (runtimeFlag !== '1') {
   const actor = (index) => `10000000-0000-4000-8000-${String(index).padStart(12, '0')}`
   const company = (index) => `20000000-0000-4000-8000-${String(index).padStart(12, '0')}`
   const quoted = (text) => `'${text.replaceAll("'", "''")}'`
-  const withRole = (role, identity, statement) => {
-    assert.ok(['anon', 'authenticated', 'service_role', 'e1_ci_reader'].includes(role))
-    assert.ok(identity === '' || uuidPattern.test(identity))
-    return `begin; set local role ${role}; set local e1_ci.actor = ${quoted(identity)}; ${statement}; rollback;`
-  }
+  const withRole = withSyntheticRole
   const denied = (text, marker) => {
     const result = sql(text)
-    assert.equal(result.status, 3, 'Expected psql ON_ERROR_STOP permission failure')
-    assert.match(result.stderr, /42501/, 'Failure must be an authorization denial, not syntax or unavailable infrastructure')
-    if (marker) assert.ok(result.stderr.includes(marker), 'Expected specific fail-closed guard')
+    assertAuthorizationDenial(result, marker)
   }
   const snapshotSql = "select jsonb_build_object('identities', (select jsonb_agg(t order by id) from e1_ci.synthetic_identities t), 'companies', (select jsonb_agg(t order by id) from e1_ci.companies t), 'memberships', (select jsonb_agg(t order by actor_id, company_id) from e1_ci.memberships t), 'history', (select jsonb_agg(t order by actor_id) from e1_ci.legacy_history t))::text"
   let snapshot
@@ -450,6 +594,7 @@ if (runtimeFlag !== '1') {
       runtimeCheck('P07', () => assert.equal(query("select obj_description('e1_ci.synthetic_identities'::regclass)"), 'H1_G1_E1_SYNTHETIC_DISPOSABLE_V1'))
       runtimeCheck('P08', () => assert.equal(query("select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname in ('companies','tenants','customer_onboarding','invoices','subscriptions','payments')"), '0'))
       runtimeCheck('P09', () => { snapshot = query(snapshotSql) })
+      prepareReaderRoleSwitch(query, denied)
     })
     runtimeTest('effective reader role lacks login, inheritance, bypass and administrative privileges', () => {
       assert.equal(query("select not rolcanlogin and not rolinherit and not rolbypassrls and not rolsuper and not rolcreatedb and not rolcreaterole and not rolreplication from pg_roles where rolname='e1_ci_reader'"), 't')
@@ -514,13 +659,10 @@ if (runtimeFlag !== '1') {
         assert.match(result.stderr, /22021/)
       }
     })
-    for (const operation of [
-      "insert into e1_ci.companies values ('20000000-0000-4000-8000-000000000009','Synthetic Attempt','active')",
-      `update e1_ci.companies set name='Synthetic Attempt' where id=${quoted(company(1))}`,
-      `delete from e1_ci.companies where id=${quoted(company(1))}`,
-      'truncate e1_ci.companies',
-      `update e1_ci.memberships set role='owner' where actor_id=${quoted(actor(2))}`,
-    ]) runtimeTest('fixture client cannot mutate Company or Owner relationships', () => denied(withRole('e1_ci_reader', actor(1), operation)))
+    for (const id of ['T45', 'T46', 'T47', 'T48', 'T49']) runtimeTest('fixture client cannot mutate Company or Owner relationships', () => {
+      const probe = mutationDenialStatement(id, actor(1))
+      denied(probe.sql, probe.marker)
+    })
     runtimeTest('fixture contains no financial, subscription, trial or portal table and records remain identical', () => {
       assert.deepEqual(JSON.parse(query("select jsonb_agg(relname order by relname)::text from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='e1_ci' and c.relkind='r'")), [
         'companies', 'legacy_history', 'memberships', 'synthetic_identities',
