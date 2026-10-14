@@ -37,6 +37,9 @@ function validateWorkflow(text) {
   const clean = text.replace(/^\s*#.*$/gm, '')
   const events = clean.match(/^"on":\n([\s\S]+?)^permissions:/m)?.[1]
   assert.ok(events)
+  const jobEnv = clean.match(/^    env:\n([\s\S]+?)^    steps:/m)?.[1]
+  assert.ok(jobEnv)
+  assert.ok(!/\$\{\{\s*runner\./.test(jobEnv), 'GitHub does not allow runner context in job env')
   assert.equal(events, "  workflow_dispatch:\n    inputs:\n      approved_sha:\n        description: Exact approved commit SHA\n        required: true\n        type: string\n")
   assert.ok(!/^\s*(push|schedule|pull_request|pull_request_target|workflow_run|repository_dispatch|services|strategy):/m.test(clean))
   assert.match(clean, /^permissions:\n  contents: read\n/m)
@@ -208,6 +211,7 @@ if (runtimeFlag !== '1') {
       ['root migrations', (text) => text.replaceAll('--workdir "$E1_FIXTURE_DIR"', '--workdir "$GITHUB_WORKSPACE"')],
       ['ambient CLI environment', (text) => text.replaceAll('env -i PATH=', 'env PATH=')],
       ['missing dispatch SHA', (text) => text.replace('github.event.inputs.approved_sha == github.sha', 'true')],
+      ['runner context in job env', (text) => text.replace('    env:\n', '    env:\n      E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture\n')],
       ['wrong repository', (text) => text.replace('RiGi26/webzoka-e1-ci-sandbox', 'another/repo')],
       ['missing commit gate', (text) => text.replace('vars.E1_ISOLATED_CI_APPROVED_SHA == github.sha', 'true')],
       ['broad cleanup', (text) => text.replace('--project-id h1-g1-e1-ci-disposable --no-backup', '--all --no-backup')],

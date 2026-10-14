@@ -28,11 +28,8 @@ jobs:
         shell: bash
     env:
       CANDIDATE_DIR: .
-      E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture
-      E1_TOOLS_DIR: ${{ runner.temp }}/h1-g1-e1-tools
       E1_DISPATCH_APPROVED_SHA: ${{ github.event.inputs.approved_sha }}
       E1_ISOLATED_CI_APPROVED_SHA: ${{ vars.E1_ISOLATED_CI_APPROVED_SHA }}
-      SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
       SUPABASE_ENV: test
       SUPABASE_EXPERIMENTAL_STACK: '0'
       SUPABASE_EXPERIMENTAL: 'false'
@@ -52,6 +49,10 @@ jobs:
           lfs: false
       - name: Install checksum-pinned tools into runner temp only
         id: tools
+        env:
+          E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture
+          E1_TOOLS_DIR: ${{ runner.temp }}/h1-g1-e1-tools
+          SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
         run: |
           set -euo pipefail
           mkdir -p "$E1_TOOLS_DIR"
@@ -69,6 +70,10 @@ jobs:
           echo 'PASS: pinned tool download and syntax checks'
       - name: Static candidate tests and stage only the synthetic fixture
         id: stage
+        env:
+          E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture
+          E1_TOOLS_DIR: ${{ runner.temp }}/h1-g1-e1-tools
+          SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
         run: |
           set -euo pipefail
           "$E1_TOOLS_DIR/node-v24.21.0-linux-x64/bin/node" --test \
@@ -87,6 +92,10 @@ jobs:
           grep -E '^# (tests|pass|fail|skipped) ' "$RUNNER_TEMP/e1-static.log"
           echo 'PASS: static checks and isolated two-file staging'
       - name: Pull and verify the exact synthetic database image
+        env:
+          E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture
+          E1_TOOLS_DIR: ${{ runner.temp }}/h1-g1-e1-tools
+          SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
         run: |
           set -euo pipefail
           timeout 300 docker pull supabase/postgres@sha256:4b438c22395a9a2bd19ee0522742cc9a1ff91db4732ff0c1b08fc07e9c767c22 \
@@ -99,6 +108,10 @@ jobs:
           echo 'PASS: pinned PostgreSQL image'
       - name: Start the disposable PostgreSQL-only Supabase fixture
         id: bootstrap
+        env:
+          E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture
+          E1_TOOLS_DIR: ${{ runner.temp }}/h1-g1-e1-tools
+          SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
         run: |
           set -euo pipefail
           timeout 600 env -i PATH="$PATH" HOME="$SUPABASE_HOME" SUPABASE_HOME="$SUPABASE_HOME" \
@@ -113,6 +126,9 @@ jobs:
           echo 'PASS: synthetic fixture bootstrap'
       - name: Run the isolated SQL security scenarios
         env:
+          E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture
+          E1_TOOLS_DIR: ${{ runner.temp }}/h1-g1-e1-tools
+          SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
           E1_ISOLATED_RUNTIME: '1'
         run: |
           set -euo pipefail
@@ -124,6 +140,10 @@ jobs:
           echo 'PASS: synthetic SQL security scenarios only; no Production equivalence'
       - name: Remove this exact local stack and its data volumes
         if: ${{ always() && steps.bootstrap.outcome != 'skipped' && steps.stage.outcome == 'success' && steps.tools.outcome == 'success' }}
+        env:
+          E1_FIXTURE_DIR: ${{ runner.temp }}/h1-g1-e1-fixture
+          E1_TOOLS_DIR: ${{ runner.temp }}/h1-g1-e1-tools
+          SUPABASE_HOME: ${{ runner.temp }}/h1-g1-e1-cli-home
         run: |
           set -euo pipefail
           timeout 90 env -i PATH="$PATH" HOME="$SUPABASE_HOME" SUPABASE_HOME="$SUPABASE_HOME" \
